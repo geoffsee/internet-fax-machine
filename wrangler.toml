@@ -1,0 +1,15 @@
+name = "internet-fax-machine"
+main = "worker.ts"
+compatibility_date = "2026-02-12"
+workers_dev = true
+
+kv_namespaces = [
+  { binding = "KV", id = "YOUR_KV_NAMESPACE_ID", preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID" }
+]
+
+[vars]
+CONNECTION_ID = "YOUR_FAX_APPLICATION_ID"
+FAX_FROM = "+15551234567"
+
+# TELNYX_API_KEY should be set as a secret:
+#   npx wrangler secret put TELNYX_API_KEY

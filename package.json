@@ -1,0 +1,11 @@
+{
+  "name": "telnyx-fax-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for sending and receiving faxes",
+  "type": "module",
+  "main": "lib.ts",
+  "scripts": {
+    "test": "bun run scripts/send-test-fax.ts"
+  },
+  "dependencies": {}
+}
