@@ -11,6 +11,15 @@ kv_namespaces = [
 CONNECTION_ID = "YOUR_FAX_APPLICATION_ID"
 FAX_FROM = "+15551234567"
 FAX_PROVIDER = "telnyx"
+# Dropbox Fax (HelloFax / Dropbox Sign)
+DROPBOX_FAX_TEST_MODE = "1"
+# Sinch Fax
+SINCH_PROJECT_ID = "YOUR_SINCH_PROJECT_ID"
 
 # TELNYX_API_KEY should be set as a secret:
 #   npx wrangler secret put TELNYX_API_KEY
+# DROPBOX_SIGN_API_KEY should be set as a secret:
+#   npx wrangler secret put DROPBOX_SIGN_API_KEY
+# Sinch access/secret keys as secrets:
+#   npx wrangler secret put SINCH_ACCESS_KEY
+#   npx wrangler secret put SINCH_SECRET_KEY

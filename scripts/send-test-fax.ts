@@ -16,8 +16,10 @@ import { basename, resolve } from "path";
 import { FaxWorkerClient } from "./lib";
 
 const to = must(process.env.FAX_TO, "FAX_TO");
-const filePath = process.env.FAX_FILE ?? resolve(import.meta.dir, "test-data/sample.pdf");
-const workerUrl = process.env.WORKER_URL ?? "https://YOUR-WORKER-NAME.workers.dev";
+const filePath =
+  process.env.FAX_FILE ?? resolve(import.meta.dir, "test-data/sample.pdf");
+const workerUrl =
+  process.env.WORKER_URL ?? "https://YOUR-WORKER-NAME.workers.dev";
 const username = process.env.WORKER_USERNAME;
 const password = process.env.WORKER_PASSWORD;
 
@@ -36,6 +38,6 @@ const result = await client.uploadAndSendFax(to, fileBuffer, fileName);
 console.log("\nSuccess:", JSON.stringify(result, null, 2));
 
 function must(v: string | undefined, name: string): string {
-    if (!v) throw new Error(`Missing env var: ${name}`);
-    return v;
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
