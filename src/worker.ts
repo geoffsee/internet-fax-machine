@@ -1,33 +1,29 @@
 /**
- * Telnyx fax receive webhook endpoint (Cloudflare Worker)
- *
- * Telnyx sends webhook events for inbound faxes as JSON POSTs.
- * Event types:
- *   - fax.received    — inbound fax completed, includes media_url
- *   - fax.sending      — outbound fax in progress
- *   - fax.sent         — outbound fax completed
- *   - fax.failed       — fax failed
- *
- * This worker:
- *   1. Accepts POST /telnyx/fax-rx
- *   2. Parses the Telnyx webhook JSON payload
- *   3. On fax.received: downloads the PDF from media_url, stores in KV
- *   4. Returns 200 to acknowledge
+ * Fax worker with pluggable providers (defaults to Telnyx).
  */
 
-type Env = {
-    KV: KVNamespace;
-    TELNYX_API_KEY?: string;
-    CONNECTION_ID?: string;
-    FAX_FROM?: string;
-    BASIC_AUTH_USER?: string;
-    BASIC_AUTH_PASS?: string;
-};
+import { FaxProvider, ProviderContext, WorkerEnv } from "./providers/types";
+import { TelnyxProvider } from "./providers/telnyx";
 
 export default {
-    async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    async fetch(req: Request, env: WorkerEnv, _ctx: ExecutionContext): Promise<Response> {
         const requestId = crypto.randomUUID();
         const url = new URL(req.url);
+
+        const providerResult = resolveProvider(env);
+        if (!providerResult.ok) {
+            return json({ ok: false, error: providerResult.error, requestId }, 500);
+        }
+        const provider = providerResult.provider;
+
+        const baseUrl = url.origin;
+        const providerCtx: ProviderContext = {
+            requestId,
+            baseUrl,
+            env,
+            kv: env.KV,
+            log,
+        };
 
         // Check basic auth for protected endpoints
         const isProtectedEndpoint =
@@ -76,10 +72,6 @@ export default {
         // Body: multipart/form-data with "file" (PDF) and "to" field
         //   or: application/json with "to" and "media_key" (existing KV media key)
         if (url.pathname === "/fax/send" && req.method === "POST") {
-            if (!env.TELNYX_API_KEY) return json({ ok: false, error: "TELNYX_API_KEY not configured" }, 500);
-            if (!env.CONNECTION_ID) return json({ ok: false, error: "CONNECTION_ID not configured" }, 500);
-            if (!env.FAX_FROM) return json({ ok: false, error: "FAX_FROM not configured" }, 500);
-
             const contentType = req.headers.get("content-type") || "";
             let to: string;
             let mediaUrl: string;
@@ -107,98 +99,17 @@ export default {
                 mediaUrl = `${url.origin}/media/${encodeURIComponent(body.media_key)}`;
             }
 
-            log(requestId, "sending fax", { to, from: env.FAX_FROM, mediaUrl });
-
-            const telnyxRes = await fetch("https://api.telnyx.com/v2/faxes", {
-                method: "POST",
-                headers: {
-                    authorization: `Bearer ${env.TELNYX_API_KEY}`,
-                    "content-type": "application/json",
-                },
-                body: JSON.stringify({
-                    connection_id: env.CONNECTION_ID,
-                    from: env.FAX_FROM,
-                    to,
-                    media_url: mediaUrl,
-                    quality: "high",
-                    t38_enabled: true,
-                    webhook_url: `${url.origin}/telnyx/fax-rx`,
-                }),
-            });
-
-            const telnyxBody = await telnyxRes.json();
-            log(requestId, "telnyx fax response", { status: telnyxRes.status, body: telnyxBody });
-
-            return json({ ok: telnyxRes.ok, requestId, fax: telnyxBody }, telnyxRes.status);
+            const sendResult = await provider.sendFax({ to, mediaUrl }, providerCtx);
+            return json({ ok: sendResult.ok, requestId, fax: sendResult.fax }, sendResult.status);
         }
 
-        if (url.pathname !== "/telnyx/fax-rx") return new Response("Not found", { status: 404 });
-        if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
-
-        try {
-            const event = (await req.json()) as TelnyxWebhookEvent;
-            const eventType = event.data?.event_type ?? "unknown";
-            const faxId = event.data?.payload?.fax_id ?? requestId;
-
-            log(requestId, "telnyx fax webhook", {
-                eventType,
-                faxId,
-                from: event.data?.payload?.from,
-                to: event.data?.payload?.to,
-                direction: event.data?.payload?.direction,
-                status: event.data?.payload?.status,
-                pageCount: event.data?.payload?.page_count,
-            });
-
-            if (eventType === "fax.received") {
-                const mediaUrl = event.data?.payload?.media_url;
-
-                if (mediaUrl) {
-                    log(requestId, "downloading fax media", { mediaUrl: mediaUrl.slice(0, 120) });
-
-                    const headers: Record<string, string> = {};
-                    if (env.TELNYX_API_KEY) {
-                        headers.authorization = `Bearer ${env.TELNYX_API_KEY}`;
-                    }
-
-                    const mediaRes = await fetch(mediaUrl, { method: "GET", headers });
-                    const mediaBytes = await mediaRes.arrayBuffer();
-
-                    const kvKey = `telnyx:fax:${faxId}.pdf`;
-                    await env.KV.put(kvKey, mediaBytes);
-
-                    log(requestId, "stored fax media in kv", {
-                        kvKey,
-                        bytes: mediaBytes.byteLength,
-                    });
-                } else {
-                    log(requestId, "fax.received but no media_url");
-                    await env.KV.put(
-                        `telnyx:fax:${faxId}:meta.json`,
-                        JSON.stringify(event.data?.payload),
-                    );
-                }
-            } else {
-                log(requestId, `event ${eventType} — storing metadata`);
-                await env.KV.put(
-                    `telnyx:fax:${faxId}:${eventType}.json`,
-                    JSON.stringify(event.data?.payload),
-                );
-            }
-
-            return new Response(JSON.stringify({ ok: true, requestId }), {
-                status: 200,
-                headers: { "content-type": "application/json" },
-            });
-        } catch (err) {
-            log(requestId, "ERROR", {
-                message: err instanceof Error ? err.message : String(err),
-            });
-            return new Response(JSON.stringify({ ok: false, requestId, error: String(err) }), {
-                status: 500,
-                headers: { "content-type": "application/json" },
-            });
+        // Provider webhook endpoint
+        if (url.pathname === provider.webhookPath) {
+            if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
+            return provider.handleWebhook(req, providerCtx);
         }
+
+        return new Response("Not found", { status: 404 });
     },
 };
 
@@ -213,7 +124,7 @@ function log(requestId: string, message: string, meta?: unknown) {
     console.log(JSON.stringify({ ts: new Date().toISOString(), requestId, message, meta }));
 }
 
-function checkBasicAuth(req: Request, env: Env): { authorized: boolean; user?: string } {
+function checkBasicAuth(req: Request, env: WorkerEnv): { authorized: boolean; user?: string } {
     // If no auth configured, allow all requests
     if (!env.BASIC_AUTH_USER || !env.BASIC_AUTH_PASS) {
         return { authorized: true };
@@ -239,23 +150,12 @@ function checkBasicAuth(req: Request, env: Env): { authorized: boolean; user?: s
     return { authorized: false };
 }
 
-// ── Telnyx webhook types ──
-
-interface TelnyxWebhookEvent {
-    data?: {
-        event_type?: string;
-        id?: string;
-        payload?: {
-            fax_id?: string;
-            direction?: string;
-            from?: string;
-            to?: string;
-            status?: string;
-            media_url?: string;
-            page_count?: number;
-            quality?: string;
-            connection_id?: string;
-            [key: string]: unknown;
-        };
-    };
+function resolveProvider(env: WorkerEnv): { ok: true; provider: FaxProvider } | { ok: false; error: string } {
+    const name = (env.FAX_PROVIDER ?? "telnyx").toLowerCase();
+    switch (name) {
+        case "telnyx":
+            return { ok: true, provider: TelnyxProvider };
+        default:
+            return { ok: false, error: `Unsupported fax provider: ${name}` };
+    }
 }

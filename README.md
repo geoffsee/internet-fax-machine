@@ -1,216 +1,145 @@
-# Telnyx Fax Worker
+# Internet Fax Worker (Cloudflare)
 
-Send and receive faxes via [Telnyx Programmable Fax](https://telnyx.com/products/programmable-fax) + a Cloudflare Worker for webhooks and media storage.
+Pluggable fax webhook + media gateway that runs on Cloudflare Workers. The worker stores fax PDFs in KV, serves them back to the fax provider, and handles status/inbound webhooks. Providers are swappable via `FAX_PROVIDER`; Telnyx is implemented first.
+
+## Features
+- HTTP API to upload media and send faxes (`/media/:key`, `/fax/send`)
+- Stores PDF payloads in KV and serves them with correct content type
+- Basic auth (optional) to protect send/upload endpoints
+- Provider abstraction (`FaxProvider`) so additional fax vendors can be added quickly
+- Tested with Bun (`bun test`)
 
 ## Architecture
 
 ```
-send-test-fax.ts                  Cloudflare Worker                  Telnyx
-─────────────────                ──────────────────                ──────────
-1. Upload PDF ──PUT /media/:key──▶ KV (media storage)
-2. Send fax ──────────────────────────────────────────▶ faxes.create()
-                                                        │
-3.                                POST /telnyx/fax-rx ◀─┘  (status webhooks)
-4.                                GET  /media/:key    ◀─┘  (Telnyx fetches PDF)
+Client / CLI               Cloudflare Worker                  Fax Provider
+─────────────             ──────────────────                ───────────────
+1. PUT /media/:key ───────▶ KV (PDF storage)
+2. POST /fax/send ────────▶ provider.sendFax()
+                                                     (provider API sends fax)
+3.                               POST /<provider webhook> ◀─┘ status/inbound
+4.                               GET  /media/:key        ◀─┘ provider fetches PDF
 ```
 
-**Inbound faxes** follow the reverse path: Telnyx receives the fax and POSTs a `fax.received` webhook with a `media_url`. The worker downloads the PDF and stores it in KV.
+Inbound fax: provider posts a `fax.received`-style webhook with `media_url`; worker downloads PDF and stores in KV.
 
-## Files
+## Providers
+- `telnyx` (default) — uses Telnyx Programmable Fax. Webhook path: `/telnyx/fax-rx`.
+- To add more, implement `FaxProvider` (see `src/providers/types.ts`) and register it in `resolveProvider` inside `src/worker.ts`.
 
-| File | Purpose |
-|---|---|
-| `lib.ts` | TypeScript client library for interacting with the worker API |
-| `send-test-fax.ts` | CLI script — example usage of the client library |
-| `worker.ts` | Cloudflare Worker — media storage + fax webhooks |
-| `wrangler.toml` | Worker deployment config |
-| `.env.example.client` | Example environment variables for CLI usage |
-| `.env.example.server` | Example environment variables for worker configuration |
+## Prerequisites
+- Bun ≥ 1.0
+- Cloudflare account + KV namespace
+- Provider account (Telnyx for now)
+- Wrangler CLI (`npm i -g wrangler`), `bun install`
 
-## Setup
+## Configuration
 
-### 1. Telnyx account
+| Key | Where | Purpose |
+|---|---|---|
+| `FAX_PROVIDER` | vars | Provider name (`telnyx` by default) |
+| `TELNYX_API_KEY` | secret | Telnyx API key |
+| `CONNECTION_ID` | vars | Telnyx fax application ID |
+| `FAX_FROM` | vars | Telnyx fax-enabled number (E.164) |
+| `BASIC_AUTH_USER` / `BASIC_AUTH_PASS` | secret | Optional: protect `/fax/send` and `/media/:key` (PUT) |
 
-- Buy a fax-enabled phone number
-- Create a **Fax Application** (not a voice/credential connection) via the API:
-  ```bash
-  curl -X POST https://api.telnyx.com/v2/fax_applications \
-    -H "Authorization: Bearer $TELNYX_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "application_name": "fax-worker",
-      "webhook_event_url": "https://YOUR-WORKER-NAME.workers.dev/telnyx/fax-rx",
-      "inbound": { "channel_limit": 10, "sip_subdomain_receive_settings": "from_anyone" },
-      "outbound": { "channel_limit": 10 }
-    }'
-  ```
-- Create an **Outbound Voice Profile** (required for sending faxes):
-  ```bash
-  curl -X POST https://api.telnyx.com/v2/outbound_voice_profiles \
-    -H "Authorization: Bearer $TELNYX_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"name": "fax-outbound", "traffic_type": "conversational", "service_plan": "global"}'
-  ```
-- Attach the outbound voice profile to the fax application:
-  ```bash
-  curl -X PATCH https://api.telnyx.com/v2/fax_applications/<fax_application_id> \
-    -H "Authorization: Bearer $TELNYX_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"outbound": {"outbound_voice_profile_id": "<outbound_voice_profile_id>"}}'
-  ```
-- Assign the phone number to the fax application:
-  ```bash
-  curl -X PATCH https://api.telnyx.com/v2/phone_numbers/+1XXXXXXXXXX \
-    -H "Authorization: Bearer $TELNYX_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"connection_id": "<fax_application_id>"}'
-  ```
+Reference files: `.env.example.server`, `wrangler.toml`.
 
-### 2. Configure worker
-
-Update `wrangler.toml` with your configuration:
-- `CONNECTION_ID` - Your Telnyx fax application ID
-- `FAX_FROM` - Your Telnyx fax-enabled phone number
-
-Set worker secrets:
-
+## Telnyx setup (one-time)
+1) Buy a fax-enabled number.  
+2) Create a Fax Application:
 ```bash
-# Required: Telnyx API key
-npx wrangler secret put TELNYX_API_KEY
+curl -X POST https://api.telnyx.com/v2/fax_applications \
+  -H "Authorization: Bearer $TELNYX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "application_name": "fax-worker",
+    "webhook_event_url": "https://YOUR-WORKER.workers.dev/telnyx/fax-rx",
+    "inbound": { "channel_limit": 10, "sip_subdomain_receive_settings": "from_anyone" },
+    "outbound": { "channel_limit": 10 }
+  }'
+```
+3) Create an Outbound Voice Profile and attach it:
+```bash
+curl -X POST https://api.telnyx.com/v2/outbound_voice_profiles \
+  -H "Authorization: Bearer $TELNYX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "fax-outbound", "traffic_type": "conversational", "service_plan": "global"}'
 
-# Optional but recommended: Basic auth credentials
-npx wrangler secret put BASIC_AUTH_USER
-npx wrangler secret put BASIC_AUTH_PASS
+curl -X PATCH https://api.telnyx.com/v2/fax_applications/<fax_application_id> \
+  -H "Authorization: Bearer $TELNYX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"outbound": {"outbound_voice_profile_id": "<outbound_voice_profile_id>"}}'
+```
+4) Assign your number to the fax application:
+```bash
+curl -X PATCH https://api.telnyx.com/v2/phone_numbers/+1XXXXXXXXXX \
+  -H "Authorization: Bearer $TELNYX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"connection_id": "<fax_application_id>"}'
 ```
 
-**Note:** Basic auth protects the upload and send endpoints. If you don't set `BASIC_AUTH_USER` and `BASIC_AUTH_PASS`, the worker will be publicly accessible.
-
-See `.env.example.server` for reference.
-
-### 3. Install and deploy
-
+## Deploy
 ```bash
 bun install
-npx wrangler deploy
+wrangler secret put TELNYX_API_KEY
+wrangler secret put BASIC_AUTH_USER  # optional
+wrangler secret put BASIC_AUTH_PASS  # optional
+wrangler deploy
 ```
 
 ## Usage
 
-### Using the client library
+### HTTP API
+- `PUT /media/:key` (auth required if basic auth configured) — store PDF in KV. Body: raw bytes; `Content-Type: application/pdf`.
+- `GET /media/:key` — serve stored PDF (no auth).
+- `POST /fax/send` (auth required if configured)  
+  - Multipart: fields `to`, file `file` (PDF).  
+  - JSON: `{ "to": "+15551234567", "media_key": "file.pdf" }` (media must already be in KV).
+- Webhook path: provider-specific (`/telnyx/fax-rx` for Telnyx). Must be reachable publicly.
 
-```typescript
+### Client library (TypeScript)
+```ts
 import { FaxWorkerClient } from "./lib";
 import { readFileSync } from "fs";
 
-const client = new FaxWorkerClient({
-    workerUrl: "https://YOUR-WORKER-NAME.workers.dev",
-    username: "your-username",  // Optional: if basic auth is enabled
-    password: "your-password"   // Optional: if basic auth is enabled
-});
-
-// Upload a file and send a fax
-const fileBuffer = readFileSync("document.pdf");
-const result = await client.uploadAndSendFax("+15551234567", fileBuffer, "document.pdf");
-
-// Or send using an already-uploaded media key
-await client.sendFax("+15551234567", "existing-file.pdf");
-
-// Or upload a file directly with the fax request (multipart)
-await client.sendFaxWithFile("+15551234567", fileBuffer, "document.pdf");
+const client = new FaxWorkerClient({ workerUrl: "https://YOUR-WORKER.workers.dev" });
+const pdf = readFileSync("document.pdf");
+await client.uploadAndSendFax("+15551234567", pdf, "document.pdf");
 ```
 
-### Send a fax via CLI
-
-Create a `.env` file based on `.env.example.client`:
-
+### CLI helper
 ```bash
-cp .env.example.client .env
-# Edit .env with your values
-```
-
-Then run:
-
-```bash
+cp .env.example.client .env && edit .env
 export $(cat .env | xargs) && bun run send-test-fax.ts
+# or: bun run send (package script)
 ```
-
-Or pass env vars directly:
-
-```bash
-FAX_TO=+15551234567 FAX_FILE=./my-doc.pdf WORKER_URL=https://your-worker.workers.dev bun run send-test-fax.ts
-```
-
-### Send a fax via the worker API
-
-**Multipart (upload PDF inline):**
-
-```bash
-curl -X POST https://YOUR-WORKER-NAME.workers.dev/fax/send \
-  -u username:password \
-  -F to="+15551234567" \
-  -F file=@document.pdf
-```
-
-**JSON (reference an already-uploaded media key):**
-
-```bash
-curl -X POST https://YOUR-WORKER-NAME.workers.dev/fax/send \
-  -u username:password \
-  -H "Content-Type: application/json" \
-  -d '{"to": "+15551234567", "media_key": "dist-page1.pdf"}'
-```
-
-**Note:** The `-u username:password` flag is only needed if basic auth is enabled on the worker.
-
-The worker stores the PDF in KV, passes the public URL to Telnyx, and returns the fax object. `CONNECTION_ID`, `FAX_FROM`, and `TELNYX_API_KEY` are configured on the worker (see wrangler.toml and secrets).
-
-### Worker endpoints
-
-| Method | Path | Auth Required | Description |
-|---|---|---|---|
-| `POST` | `/fax/send` | ✅ Yes | Send a fax. Accepts multipart (`file` + `to`) or JSON (`media_key` + `to`). |
-| `PUT` | `/media/:key` | ✅ Yes | Upload a file to KV. Returns `{ mediaUrl }`. |
-| `GET` | `/media/:key` | ❌ No | Serve a file from KV. Used by Telnyx to fetch the PDF. |
-| `POST` | `/telnyx/fax-rx` | ❌ No | Telnyx webhook receiver. Handles all fax events. |
 
 ### Monitor logs
-
 ```bash
-npx wrangler tail --format pretty
+wrangler tail --format pretty
 ```
 
-## How sending works
+### Run tests
+```bash
+bun test
+```
 
-1. Client uploads PDF to the worker via `PUT /media/<filename>` (stored in Cloudflare KV)
-2. Client calls `POST /fax/send` with the destination number and media key
-3. Worker calls Telnyx API to send the fax, passing the public `media_url` pointing back to the worker
-4. Telnyx fetches the PDF from `GET /media/<filename>`, converts to TIFF, and sends via T.38
-5. Status webhooks (`fax.queued`, `fax.sending.started`, `fax.delivered` or `fax.failed`) POST to `/telnyx/fax-rx`
+## Flows
+**Sending:** upload PDF → POST `/fax/send` → worker calls provider send API → provider fetches PDF from `/media/:key` → status webhooks to provider path.  
+**Receiving:** provider webhook includes `media_url` → worker downloads PDF using provider auth → stores in KV (`telnyx:fax:<id>.pdf`) → responds 200.
 
-## How receiving works
+## Extending to a new provider
+1) Create `src/providers/<name>.ts` implementing `FaxProvider`.  
+2) Register it in `resolveProvider` inside `src/worker.ts`.  
+3) Set `FAX_PROVIDER=<name>` in `wrangler.toml` or env.  
+4) Deploy; point the provider webhook to the new `webhookPath`.
 
-1. Telnyx receives an inbound fax on your number
-2. Telnyx POSTs a `fax.received` event to `/telnyx/fax-rx` with a `media_url`
-3. The worker downloads the PDF from Telnyx (authenticated with `TELNYX_API_KEY`)
-4. Stores the PDF in KV under `telnyx:fax:<fax_id>.pdf`
-
-## Example config
-
-| Resource | Value |
+## Example values
+| Item | Example |
 |---|---|
+| Worker URL | https://your-worker.workers.dev |
+| KV namespace | YOUR_KV_NAMESPACE_ID |
 | Telnyx number | +15551234567 |
 | Fax application ID | YOUR_FAX_APPLICATION_ID |
 | Outbound voice profile ID | YOUR_OUTBOUND_VOICE_PROFILE_ID |
-| Worker URL | https://YOUR-WORKER-NAME.workers.dev |
-| KV namespace | YOUR_KV_NAMESPACE_ID |
-
-## Telnyx webhook events
-
-| Event | When |
-|---|---|
-| `fax.queued` | Fax accepted and queued for sending |
-| `fax.media.processed` | PDF converted to TIFF successfully |
-| `fax.sending.started` | T.38 transmission started |
-| `fax.delivered` | Fax delivered successfully |
-| `fax.failed` | Fax failed (check `failure_reason`) |
-| `fax.received` | Inbound fax received (includes `media_url`) |

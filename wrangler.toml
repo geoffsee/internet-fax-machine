@@ -10,6 +10,7 @@ kv_namespaces = [
 [vars]
 CONNECTION_ID = "YOUR_FAX_APPLICATION_ID"
 FAX_FROM = "+15551234567"
+FAX_PROVIDER = "telnyx"
 
 # TELNYX_API_KEY should be set as a secret:
 #   npx wrangler secret put TELNYX_API_KEY
